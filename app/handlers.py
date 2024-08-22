@@ -9,10 +9,11 @@ from app.scripts import (
     count_tokens, 
     get_total_price,
     extract_text_from_docx,
-    extract_text_from_txt
+    extract_text_from_txt,
+    send_feedback_via_email
 )
 
-from app.api import fetch_chatgpt_response, fetch_dalle_response, create_invoice
+from app.api import fetch_chatgpt_response, fetch_dalle_response, create_invoice, transcribe_voice_to_text
 import app.keyboards as kb
 import app.keyboards as kb
 
@@ -41,6 +42,7 @@ from data.database.query import (
     decrement_free_requests,
     add_message_to_history,
     get_dialogue_history,
+    get_referral_user,
     get_subscription_end_date,
     user_has_subscription,
     activate_subscription
@@ -50,8 +52,13 @@ from data.outputs import answer_texts, default_answer_texts
 import config
 import os
 
+import io
+from jinja2 import Environment, FileSystemLoader
+import tempfile
+
 
 router = Router()
+env = Environment(loader=FileSystemLoader('templates'))
 
 
 class States(StatesGroup):
@@ -74,7 +81,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
     args = message.text.split()[1:]
     if args:
         referrer_id = int(args[0])
-        await increment_referral_count(id=referrer_id)
+        referral_user = get_referral_user(id=int(message.from_user.id))
+
+        if int(referral_user) != 0 and referrer_id != int(message.from_user.id):
+            await increment_referral_count(id=referrer_id)
 
     else:
         referrer_id = 0
@@ -279,7 +289,7 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
     if s_type is not None:
         amount = 3.49 if s_type == 'm' else 29.99
         link = await create_invoice(amount=amount)
-        await callback.message.edit_text(text=f'Для продолжения оплаты перейдите по ссылке:\n\n{link}')
+        await callback.message.edit_text(text=f'Для оплаты перейдите по ссылке:\n\n{link}')
         
     await state.clear()
 
@@ -393,17 +403,31 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == 'show_history')
 async def func(callback: types.CallbackQuery, state: FSMContext):
-    history = await get_dialogue_history(id=int(callback.from_user.id))
-    if history is not None:
-        await callback.message.answer(
-            text=history, 
-            parse_mode='Markdown', 
-        )
+    message_history, current_dialog_index = await get_dialogue_history(id=int(callback.from_user.id), need_parse=False)
+    
+    if str(current_dialog_index) in message_history:
+        history = message_history[str(current_dialog_index)]
+
+        template = env.get_template('template.html')
+        rendered_html = template.render(messages=history)
+        
+        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.html', encoding='utf-8') as temp_file:
+            temp_file.write(rendered_html)
+            temp_file_path = temp_file.name
+
+        try:
+            await callback.message.answer_document(
+                document=types.FSInputFile(temp_file_path, filename=f"history_{callback.from_user.id}.html"),
+                caption="Ваша история сообщений"
+            )
+        finally:
+            os.remove(temp_file_path)
     else:
         await callback.message.answer(
             text=answer_texts.get(str(callback.from_user.language_code), default_answer_texts).get('empty_history'), 
             parse_mode='html', 
         )
+    
     await callback.answer()
 
 
@@ -489,7 +513,12 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
     previous_message = await state.get_data()
     last_message = previous_message.get('last_message', None)
 
-    if last_message is not None:
+    if 'state_last_message_image_url' in last_message:
+        last_message, image_url = last_message.split('state_last_message_image_url=')
+    else:
+        image_url = None
+
+    if last_message is not None or image_url is not None:
         data_for_request = first_promt, second_promt, dialogue_model, free_requests = await get_data_for_request(id=int(callback.from_user.id))
 
         token_count = await count_tokens(
@@ -523,9 +552,11 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
                 )
 
                 response = await fetch_chatgpt_response(
+                    id=int(callback.from_user.id),
                     model=str(dialogue_model),
                     prompt=str(last_message),
-                    instructions=''
+                    instructions='',
+                    image_url=image_url
 
                 )
                 await sent_message.delete()
@@ -564,9 +595,11 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
                 )
 
                 response = await fetch_chatgpt_response(
+                    id=int(callback.from_user.id),
                     model=str(dialogue_model),
                     prompt=str(last_message),
-                    instructions=f"{first_promt} {second_promt}"
+                    instructions=f"{first_promt} {second_promt}",
+                    image_url=image_url
                 )
 
                 await sent_message.delete()
@@ -618,7 +651,7 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
 @router.message(States.chat)
 # @router.message(States.chat, content_types=[types.ContentType.TEXT, types.ContentType.DOCUMENT])
 async def func(message: types.Message, state: FSMContext):
-    text = message.caption if message.caption else ""
+    text = message.caption if message.caption else message.text if message.text else ""
     
     if message.document:
         document = message.document
@@ -640,8 +673,19 @@ async def func(message: types.Message, state: FSMContext):
         else:
             await message.answer("Поддерживаются только файлы .txt и .docx")
             return
+        
+    elif message.voice:
+        voice = message.voice
+        file_info = await message.bot.get_file(voice.file_id)
+        voice_url = f'https://api.telegram.org/file/bot{message.bot.token}/{file_info.file_path}'
+        text = await transcribe_voice_to_text(file_url=voice_url)
+
+    if message.photo:
+        photo = message.photo[-1]
+        file_info = await message.bot.get_file(photo.file_id)
+        image_url = f'https://api.telegram.org/file/bot{message.bot.token}/{file_info.file_path}'
     else:
-        text = message.text
+        image_url = None
 
     data_for_request = first_promt, second_promt, dialogue_model, free_requests = await get_data_for_request(id=int(message.from_user.id))
 
@@ -669,9 +713,11 @@ async def func(message: types.Message, state: FSMContext):
                 parse_mode='html', 
             )
             response = await fetch_chatgpt_response(
+                id=int(message.from_user.id),
                 model=str(dialogue_model),
                 prompt=str(text),
-                instructions=''
+                instructions='',
+                image_url=image_url
 
             )
             await sent_message.delete()
@@ -710,9 +756,11 @@ async def func(message: types.Message, state: FSMContext):
             )
 
             response = await fetch_chatgpt_response(
+                id=int(message.from_user.id),
                 model=str(dialogue_model),
                 prompt=str(text),
-                instructions=f"{first_promt} {second_promt}"
+                instructions=f"{first_promt} {second_promt}",
+                image_url=image_url
             )
 
             await sent_message.delete()
@@ -769,12 +817,12 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
 @router.message(States.feedback)
 async def func(message: types.Message, state: FSMContext):
     await state.clear()
-    for admin_id in config.ADMIN_CHAT_IDS:
-        try:
-            await message.forward(chat_id=int(admin_id))
-        except Exception as e:
-            print(f"Failed to forward message to admin {admin_id}: {e}")
-
+    # for admin_id in config.ADMIN_CHAT_IDS:
+    #     try:
+    #         await message.forward(chat_id=int(admin_id))
+    #     except Exception as e:
+    #         print(f"Failed to forward message to admin {admin_id}: {e}")
+    await send_feedback_via_email(feedback=str(message.text), user_id=int(message.from_user.id))
     await message.answer(
         text=answer_texts.get(str(message.from_user.language_code), default_answer_texts).get('feedback_2'), 
         parse_mode='html', 
@@ -936,7 +984,7 @@ async def func(message: types.Message, state: FSMContext):
 
     dialogue_names = await get_dialogue_names(id=int(message.from_user.id))
 
-    text = message.caption if message.caption else ""
+    text = message.caption if message.caption else message.text if message.text else ""
     
     if message.document:
         document = message.document
@@ -958,8 +1006,18 @@ async def func(message: types.Message, state: FSMContext):
         else:
             await message.answer("Поддерживаются только файлы .txt и .docx")
             return
-    else:
-        text = message.text
+        
+    elif message.voice:
+        voice = message.voice
+        file_info = await message.bot.get_file(voice.file_id)
+        voice_url = f'https://api.telegram.org/file/bot{message.bot.token}/{file_info.file_path}'
+        text = await transcribe_voice_to_text(file_url=voice_url)
+
+    if message.photo:
+        photo = message.photo[-1]
+        file_info = await message.bot.get_file(photo.file_id)
+        image_url = f'https://api.telegram.org/file/bot{message.bot.token}/{file_info.file_path}'
+        text += f"state_last_message_image_url={image_url}"
 
     await state.update_data(last_message=text)
 
