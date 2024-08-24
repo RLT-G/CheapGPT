@@ -45,7 +45,9 @@ from data.database.query import (
     get_referral_user,
     get_subscription_end_date,
     user_has_subscription,
-    activate_subscription
+    activate_subscription,
+    referral_replenishment,
+    is_ther_a_user
 )
 
 from data.outputs import answer_texts, default_answer_texts
@@ -79,11 +81,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     # https://t.me/chatgpt_kaba_bot?start=test
     args = message.text.split()[1:]
+    args = message.text.split()[1:]
     if args:
         referrer_id = int(args[0])
-        referral_user = get_referral_user(id=int(message.from_user.id))
+        not_new_user = await is_ther_a_user(int(message.from_user.id))
 
-        if int(referral_user) != 0 and referrer_id != int(message.from_user.id):
+        if not not_new_user:
             await increment_referral_count(id=referrer_id)
 
     else:
@@ -240,7 +243,7 @@ async def send_invoice_handler(callback: types.CallbackQuery, state: FSMContext)
     data = await state.get_data()
     s_type = data.get('s_type', None)
     if s_type is not None:
-        amount = math.ceil(92.66 * 3.49 if s_type == 'm' else 92.66 * 29.99) * 100
+        amount = math.ceil(329 if s_type == 'm' else 2388 ) * 100
         await callback.message.delete()
         await callback.message.answer_invoice(        
             title="Пополнение баланса.",
@@ -273,11 +276,19 @@ async def success_payment_handler(message: types.CallbackQuery, state: FSMContex
         if s_type == 'm':
             await activate_subscription(id=int(message.from_user.id), is_monthly=True)
             await message.answer(text="✅ Ежемесячная подписка успешно оформленна")
+            payment_amount = 329
             ...
         if s_type == 'y':
             await activate_subscription(id=int(message.from_user.id), is_monthly=False)
             await message.answer(text="✅ Годовая подписка успешно оформленна")
+            payment_amount = 2388 
             ...
+
+        referral_user = await get_referral_user(id=int(message.from_user.id))
+
+        if int(referral_user) != 0: 
+            price = payment_amount * 0.1
+            await referral_replenishment(id=int(referral_user), price=price)
 
         await state.clear()
 
@@ -504,6 +515,10 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
 # @router.callback_query('c_' in F.data)
 @router.callback_query(ContainsCallbackData(substring='c_'))
 async def func(callback: types.CallbackQuery, state: FSMContext):
+    sent_message = await callback.message.edit_text(
+        text="Обработка запроса...", 
+        parse_mode='html', 
+    )
 
     await set_current_dialog_index(
         id=int(callback.from_user.id), 
@@ -546,10 +561,7 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
                 )
 
             elif int(free_requests) != 0 and dialogue_model == 'gpt-4o-mini':
-                sent_message = await callback.message.edit_text(
-                    text="Обработка запроса...", 
-                    parse_mode='html', 
-                )
+                
 
                 response = await fetch_chatgpt_response(
                     id=int(callback.from_user.id),
@@ -559,7 +571,6 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
                     image_url=image_url
 
                 )
-                await sent_message.delete()
 
                 await callback.message.answer(
                     text=f"{response}",
@@ -589,10 +600,6 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
 
         else:
             try:
-                sent_message = await callback.message.edit_text(
-                    text="Обработка запроса...", 
-                    parse_mode='html', 
-                )
 
                 response = await fetch_chatgpt_response(
                     id=int(callback.from_user.id),
@@ -601,8 +608,6 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
                     instructions=f"{first_promt} {second_promt}",
                     image_url=image_url
                 )
-
-                await sent_message.delete()
 
                 await callback.message.answer(
                     text=f"{response}", 
@@ -622,6 +627,9 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
 
             except Exception as ex:
                 print(f'Ошибка в обработке запроса к OpenAI, {ex}')
+
+    await sent_message.delete()
+    
 
 
 # @router.callback_query('d_' in F.data)
@@ -651,6 +659,11 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
 @router.message(States.chat)
 # @router.message(States.chat, content_types=[types.ContentType.TEXT, types.ContentType.DOCUMENT])
 async def func(message: types.Message, state: FSMContext):
+    sent_message = await message.answer(
+        text="Обработка запроса...", 
+        parse_mode='html', 
+    )
+
     text = message.caption if message.caption else message.text if message.text else ""
     
     if message.document:
@@ -708,10 +721,7 @@ async def func(message: types.Message, state: FSMContext):
             )
 
         elif int(free_requests) != 0 and dialogue_model == 'gpt-4o-mini':
-            sent_message = await message.answer(
-                text="Обработка запроса...", 
-                parse_mode='html', 
-            )
+            
             response = await fetch_chatgpt_response(
                 id=int(message.from_user.id),
                 model=str(dialogue_model),
@@ -720,7 +730,6 @@ async def func(message: types.Message, state: FSMContext):
                 image_url=image_url
 
             )
-            await sent_message.delete()
 
             await message.answer(
                 text=f"{response}",
@@ -750,11 +759,6 @@ async def func(message: types.Message, state: FSMContext):
 
     else:
         try:
-            sent_message = await message.answer(
-                text="Обработка запроса...", 
-                parse_mode='html', 
-            )
-
             response = await fetch_chatgpt_response(
                 id=int(message.from_user.id),
                 model=str(dialogue_model),
@@ -763,7 +767,6 @@ async def func(message: types.Message, state: FSMContext):
                 image_url=image_url
             )
 
-            await sent_message.delete()
             await message.answer(
                 text=f"{response}", 
                 parse_mode='Markdown', 
@@ -782,6 +785,9 @@ async def func(message: types.Message, state: FSMContext):
 
         except Exception as ex:
             print(f'Ошибка в обработке запроса к OpenAI, {ex}')
+
+    await sent_message.delete()
+    
 
 
 @router.callback_query(F.data == 'more')
@@ -963,7 +969,8 @@ async def func(callback: types.CallbackQuery):
             .get('see_promts')
             .format(*await get_promts(id=int(callback.from_user.id))
         ),
-        reply_markup=await kb.see_promts(str(callback.from_user.language_code))
+        reply_markup=await kb.see_promts(str(callback.from_user.language_code)),
+        parse_mode='html'
     )
     await callback.answer()
 
@@ -980,6 +987,10 @@ async def func(callback: types.CallbackQuery):
 
 @router.message()
 async def func(message: types.Message, state: FSMContext):
+    sent_message = await message.answer(
+        text="Обработка...", 
+        parse_mode='html', 
+    )
     await state.clear()
 
     dialogue_names = await get_dialogue_names(id=int(message.from_user.id))
@@ -1026,4 +1037,7 @@ async def func(message: types.Message, state: FSMContext):
         parse_mode='html', 
         reply_markup=await kb.dialogue(laungage_code=str(message.from_user.language_code), dialogue_names=dialogue_names, need_continue=True)
     )
+
+    await sent_message.delete()
+
     
