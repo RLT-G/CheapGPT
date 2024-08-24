@@ -247,7 +247,7 @@ async def send_invoice_handler(callback: types.CallbackQuery, state: FSMContext)
         await callback.message.delete()
         await callback.message.answer_invoice(        
             title="Пополнение баланса.",
-            description="Пополнение кошелька для использования ИИ.\n Конечная сумма будет переведена в USD",
+            description="Пополнение кошелька.\n Конечная сумма будет переведена в USD",
             payload="Payment",
             provider_token=config.YOUKASSA_TEST_TOKEN if config.DEBUG else config.YOUKASSA_TOKEN,
             currency="rub",
