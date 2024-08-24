@@ -80,7 +80,7 @@ async def send_feedback_via_email(feedback, user_id):
     email_password = config.EMAIL_PASSWORD
     email_receivers = config.EMAIL_RECEIVERS.split(',')
 
-    subject = f"KabaGPT. Обратная связь от пользователя {user_id}."
+    subject = f"ChastGPT mini. Обратная связь от пользователя {user_id}."
     body = feedback
 
     for email_receiver in email_receivers:
