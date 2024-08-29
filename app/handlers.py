@@ -4,13 +4,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from app.custom_filter import ContainsCallbackData
 import math
+import asyncio
 
 from app.scripts import (
     count_tokens, 
     get_total_price,
     extract_text_from_docx,
     extract_text_from_txt,
-    send_feedback_via_email
+    send_feedback_via_email,
+    is_markdown_valid,
+    split_text
 )
 
 from app.api import fetch_chatgpt_response, fetch_dalle_response, create_invoice, transcribe_voice_to_text
@@ -150,7 +153,6 @@ async def wallet(message: types.Message, state: FSMContext):
             parse_mode='html',
             reply_markup=await kb.wallet(laungage_code=str(message.from_user.language_code), has_subscription=has_subscription)
         )
-
 
 
 @router.message(Command('dialogues'))
@@ -545,14 +547,14 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
 
         if not has_subscription:
             if int(free_requests) == 0:
-                await callback.message.edit_text(
+                await callback.message.answer(
                     text=answer_texts.get(str(callback.from_user.language_code), default_answer_texts).get('not_money_not_limit'), 
                     parse_mode='html', 
                     reply_markup=await kb.to_wallet(str(callback.from_user.language_code))
                 )
 
             elif int(free_requests) != 0 and dialogue_model != 'gpt-4o-mini':
-                await callback.message.edit_text(
+                await callback.message.answer(
                     text=answer_texts.get(str(callback.from_user.language_code), default_answer_texts)
                         .get('not_money')
                         .format(free_requests), 
@@ -571,11 +573,18 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
                     image_url=image_url
 
                 )
+                parts = split_text(response)
 
-                await callback.message.answer(
-                    text=f"{response}",
-                    parse_mode='Markdown', 
-                )
+                for part in parts:
+                    if is_markdown_valid(text=part):
+                        await callback.message.answer(
+                            text=f"{part}",
+                            parse_mode='Markdown',
+                        )
+                    else:
+                        await callback.message.answer(
+                            text=f"{part}",
+                        )
 
                 await decrement_free_requests(id=int(callback.from_user.id))
 
@@ -608,11 +617,18 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
                     instructions=f"{first_promt} {second_promt}",
                     image_url=image_url
                 )
+                parts = split_text(response)
 
-                await callback.message.answer(
-                    text=f"{response}", 
-                    parse_mode='Markdown', 
-                )
+                for part in parts:
+                    if is_markdown_valid(text=part):
+                        await callback.message.answer(
+                            text=f"{part}", 
+                            parse_mode='Markdown', 
+                        )
+                    else:
+                        await callback.message.answer(
+                            text=f"{part}", 
+                        )
 
                 await add_message_to_history(
                     id=str(callback.from_user.id),
@@ -656,38 +672,76 @@ async def func(callback: types.CallbackQuery, state: FSMContext):
     )
 
 
+media_group_ids: dict = {}
+media_group_messages: dict = {}
+
 @router.message(States.chat)
-# @router.message(States.chat, content_types=[types.ContentType.TEXT, types.ContentType.DOCUMENT])
 async def func(message: types.Message, state: FSMContext):
-    sent_message = await message.answer(
-        text="Обработка запроса...", 
-        parse_mode='html', 
-    )
-
-    text = message.caption if message.caption else message.text if message.text else ""
     
-    if message.document:
-        document = message.document
-        if document.mime_type in ['text/plain', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']:
-            file_info = await message.bot.get_file(document.file_id)
-            downloaded_file = await message.bot.download_file(file_info.file_path)
+    if message.media_group_id is not None:
+        is_media_group = True
 
-            file_path = document.file_name
-            with open(file_path, 'wb') as new_file:
-                new_file.write(downloaded_file.getvalue())
+        if not (str(message.from_user.id) in media_group_ids):
+            media_group_ids[str(message.from_user.id)] = set()
+            media_group_messages[str(message.from_user.id)] = []
 
-            if document.mime_type == 'text/plain':
-                file_text = await extract_text_from_txt(file_path)
-            elif document.mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                file_text = await extract_text_from_docx(file_path)
-            os.remove(file_path)
-
-            text = f"{text}\n\n{file_text}" if text else file_text
-        else:
-            await message.answer("Поддерживаются только файлы .txt и .docx")
+        if message.media_group_id in media_group_ids.get(str(message.from_user.id)):
+            media_group_messages[str(message.from_user.id)].append(message)
             return
         
-    elif message.voice:
+        else:
+            media_group_ids[str(message.from_user.id)].add(message.media_group_id)
+            media_group_messages[str(message.from_user.id)].append(message)
+            sent_message = await message.answer(
+                text="Обработка запроса...", 
+                parse_mode='html', 
+            )
+            await asyncio.sleep(5)
+    else:
+        is_media_group = False
+    
+
+    if not is_media_group:
+        sent_message = await message.answer(
+            text="Обработка запроса...", 
+            parse_mode='html', 
+        )
+
+    if not is_media_group:
+        messages = [message, ] 
+    else:
+        messages = media_group_messages[str(message.from_user.id)]
+
+    text = ''
+
+    for message in messages:
+        text += message.caption if message.caption else message.text if message.text else ""
+        
+        if message.document:
+            document = message.document
+            if document.mime_type in ['text/plain', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']:
+                file_info = await message.bot.get_file(document.file_id)
+                downloaded_file = await message.bot.download_file(file_info.file_path)
+
+                file_path = document.file_name
+                with open(file_path, 'wb') as new_file:
+                    new_file.write(downloaded_file.getvalue())
+
+                if document.mime_type == 'text/plain':
+                    file_text = await extract_text_from_txt(file_path)
+                elif document.mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+                    file_text = await extract_text_from_docx(file_path)
+                os.remove(file_path)
+
+                text += f"\n\n{file_text}"
+            else:
+                await message.answer("Поддерживаются только файлы .txt и .docx")
+                return
+    
+    if is_media_group:
+        media_group_messages[str(message.from_user.id)] = []
+
+    if message.voice:
         voice = message.voice
         file_info = await message.bot.get_file(voice.file_id)
         voice_url = f'https://api.telegram.org/file/bot{message.bot.token}/{file_info.file_path}'
@@ -730,11 +784,18 @@ async def func(message: types.Message, state: FSMContext):
                 image_url=image_url
 
             )
+            parts = split_text(response)
 
-            await message.answer(
-                text=f"{response}",
-                parse_mode='Markdown', 
-            )
+            for part in parts:
+                if is_markdown_valid(text=part):
+                    await message.answer(
+                        text=f"{part}",
+                        parse_mode='Markdown', 
+                    )
+                else:
+                    await message.answer(
+                        text=f"{part}",
+                    )
             await decrement_free_requests(id=int(message.from_user.id))
 
             # await message.answer(
@@ -766,11 +827,18 @@ async def func(message: types.Message, state: FSMContext):
                 instructions=f"{first_promt} {second_promt}",
                 image_url=image_url
             )
+            parts = split_text(response)
 
-            await message.answer(
-                text=f"{response}", 
-                parse_mode='Markdown', 
-            )
+            for part in parts:
+                if is_markdown_valid(text=part):
+                    await message.answer(
+                        text=f"{part}", 
+                        parse_mode='Markdown', 
+                    )
+                else:
+                    await message.answer(
+                        text=f"{part}", 
+                    )
 
             await add_message_to_history(
                 id=str(message.from_user.id),
@@ -786,6 +854,7 @@ async def func(message: types.Message, state: FSMContext):
         except Exception as ex:
             print(f'Ошибка в обработке запроса к OpenAI, {ex}')
 
+    # await state.update_data(media_group_is_added="False")
     await sent_message.delete()
     
 
@@ -987,38 +1056,74 @@ async def func(callback: types.CallbackQuery):
 
 @router.message()
 async def func(message: types.Message, state: FSMContext):
-    sent_message = await message.answer(
-        text="Обработка...", 
-        parse_mode='html', 
-    )
     await state.clear()
 
     dialogue_names = await get_dialogue_names(id=int(message.from_user.id))
 
-    text = message.caption if message.caption else message.text if message.text else ""
-    
-    if message.document:
-        document = message.document
-        if document.mime_type in ['text/plain', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']:
-            file_info = await message.bot.get_file(document.file_id)
-            downloaded_file = await message.bot.download_file(file_info.file_path)
+    if message.media_group_id is not None:
+        is_media_group = True
 
-            file_path = document.file_name
-            with open(file_path, 'wb') as new_file:
-                new_file.write(downloaded_file.getvalue())
+        if not (str(message.from_user.id) in media_group_ids):
+            media_group_ids[str(message.from_user.id)] = set()
+            media_group_messages[str(message.from_user.id)] = []
 
-            if document.mime_type == 'text/plain':
-                file_text = await extract_text_from_txt(file_path)
-            elif document.mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                file_text = await extract_text_from_docx(file_path)
-            os.remove(file_path)
-
-            text = f"{text}\n\n{file_text}" if text else file_text
-        else:
-            await message.answer("Поддерживаются только файлы .txt и .docx")
+        if message.media_group_id in media_group_ids.get(str(message.from_user.id)):
+            media_group_messages[str(message.from_user.id)].append(message)
             return
         
-    elif message.voice:
+        else:
+            media_group_ids[str(message.from_user.id)].add(message.media_group_id)
+            media_group_messages[str(message.from_user.id)].append(message)
+            sent_message = await message.answer(
+                text="Обработка...", 
+                parse_mode='html', 
+            )
+            await asyncio.sleep(5)
+    else:
+        is_media_group = False
+
+
+    if not is_media_group:
+        sent_message = await message.answer(
+            text="Обработка...", 
+            parse_mode='html', 
+        )
+
+    if not is_media_group:
+        messages = [message, ] 
+    else:
+        messages = media_group_messages[str(message.from_user.id)]
+
+    text = ''
+
+    for message in messages:
+        text += message.caption if message.caption else message.text if message.text else ""
+        
+        if message.document:
+            document = message.document
+            if document.mime_type in ['text/plain', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']:
+                file_info = await message.bot.get_file(document.file_id)
+                downloaded_file = await message.bot.download_file(file_info.file_path)
+
+                file_path = document.file_name
+                with open(file_path, 'wb') as new_file:
+                    new_file.write(downloaded_file.getvalue())
+
+                if document.mime_type == 'text/plain':
+                    file_text = await extract_text_from_txt(file_path)
+                elif document.mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+                    file_text = await extract_text_from_docx(file_path)
+                os.remove(file_path)
+
+                text += f"\n\n{file_text}"
+            else:
+                await message.answer("Поддерживаются только файлы .txt и .docx")
+                return
+
+    if is_media_group:
+        media_group_messages[str(message.from_user.id)] = []
+        
+    if message.voice:
         voice = message.voice
         file_info = await message.bot.get_file(voice.file_id)
         voice_url = f'https://api.telegram.org/file/bot{message.bot.token}/{file_info.file_path}'
